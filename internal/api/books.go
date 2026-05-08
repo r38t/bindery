@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -22,14 +23,28 @@ import (
 type BookHandler struct {
 	books     *db.BookRepo
 	meta      *metadata.Aggregator
+	lookup    BookMetaLookup // used by Rebind; defaults to meta when non-nil
 	history   *db.HistoryRepo
 	searcher  BookSearcher
 	settings  *db.SettingsRepo
 	downloads *db.DownloadRepo
+	authors   *db.AuthorRepo
+	series    *db.SeriesRepo
 }
 
 func NewBookHandler(books *db.BookRepo, meta *metadata.Aggregator, history *db.HistoryRepo, searcher BookSearcher) *BookHandler {
-	return &BookHandler{books: books, meta: meta, history: history, searcher: searcher}
+	h := &BookHandler{books: books, meta: meta, history: history, searcher: searcher}
+	if meta != nil {
+		h.lookup = meta
+	}
+	return h
+}
+
+// WithMetaLookup overrides the BookMetaLookup used by Rebind. Useful in tests
+// to inject a stub without a real HTTP client.
+func (h *BookHandler) WithMetaLookup(l BookMetaLookup) *BookHandler {
+	h.lookup = l
+	return h
 }
 
 // WithSettings wires in the settings repo so the book handler can consult the
@@ -43,6 +58,18 @@ func (h *BookHandler) WithSettings(settings *db.SettingsRepo) *BookHandler {
 // download records when a book is deleted with ?deleteFiles=true.
 func (h *BookHandler) WithDownloads(d *db.DownloadRepo) *BookHandler {
 	h.downloads = d
+	return h
+}
+
+// WithAuthors wires in the author repo so Rebind can detect author mismatches.
+func (h *BookHandler) WithAuthors(a *db.AuthorRepo) *BookHandler {
+	h.authors = a
+	return h
+}
+
+// WithSeries wires in the series repo so Rebind can re-link series membership.
+func (h *BookHandler) WithSeries(s *db.SeriesRepo) *BookHandler {
+	h.series = s
 	return h
 }
 
@@ -456,8 +483,181 @@ func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, books)
 }
 
-// ToggleExcluded flips the excluded flag on a book. The response body is the
-// updated book so the UI can refresh in place without a second round-trip.
+// Rebind updates a book's foreign_id and metadata_provider, then re-fetches
+// metadata from that provider. This lets users correct a wrong metadata match
+// (e.g. an omnibus instead of the standalone Book 1) without deleting and
+// re-adding the book.
+//
+// Request body:
+//
+//	{
+//	  "provider":   "openlibrary"|"hardcover",
+//	  "foreign_id": "<id>",
+//	  "force":      false   // set true to override an author-mismatch warning
+//	}
+//
+// Returns 409 when the upstream record belongs to a different author unless
+// force=true is passed. Returns the updated book JSON on success.
+func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	book, err := h.books.GetByID(r.Context(), id)
+	if err != nil || book == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+		return
+	}
+
+	var req struct {
+		Provider  string `json:"provider"`
+		ForeignID string `json:"foreign_id"`
+		Force     bool   `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	req.Provider = strings.TrimSpace(strings.ToLower(req.Provider))
+	req.ForeignID = strings.TrimSpace(req.ForeignID)
+	if req.Provider == "" || req.ForeignID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider and foreign_id are required"})
+		return
+	}
+	switch req.Provider {
+	case "openlibrary", "hardcover":
+		// valid
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider must be 'openlibrary' or 'hardcover'"})
+		return
+	}
+
+	if h.lookup == nil {
+		writeJSON(w, http.StatusFailedDependency, map[string]string{"error": "metadata aggregator not configured"})
+		return
+	}
+
+	upstream, err := h.lookup.GetBookFromProvider(r.Context(), req.Provider, req.ForeignID)
+	if err != nil {
+		slog.Warn("rebind: upstream fetch failed", "bookId", book.ID, "provider", req.Provider, "foreignId", req.ForeignID, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if upstream == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no record found for that provider and foreign ID"})
+		return
+	}
+
+	// Author-mismatch guard: if the upstream record belongs to a different
+	// author than the current book row, reject unless the caller passes force=true.
+	// This prevents a typo in the foreign ID from silently corrupting authorship.
+	if !req.Force && h.authors != nil && upstream.Author != nil && upstream.Author.ForeignID != "" {
+		currentAuthor, authErr := h.authors.GetByID(r.Context(), book.AuthorID)
+		if authErr == nil && currentAuthor != nil && currentAuthor.ForeignID != upstream.Author.ForeignID {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "author mismatch: upstream record belongs to a different author",
+				"current_author":  currentAuthor.Name,
+				"upstream_author": upstream.Author.Name,
+				"force_required":  true,
+			})
+			return
+		}
+	}
+
+	// Snapshot old identifiers for the audit trail before mutating the book.
+	oldProvider := book.MetadataProvider
+	oldForeignID := book.ForeignID
+
+	// Update the book with the new foreign ID and refreshed metadata.
+	// Preserve fields managed by the user or the import pipeline (status,
+	// monitored, file paths, media type, ASIN, narrator, calibre_id).
+	book.ForeignID = req.ForeignID
+	book.MetadataProvider = req.Provider
+	if upstream.Title != "" {
+		book.Title = upstream.Title
+		book.SortTitle = upstream.SortTitle
+	}
+	if upstream.OriginalTitle != "" {
+		book.OriginalTitle = upstream.OriginalTitle
+	}
+	if upstream.Description != "" {
+		book.Description = upstream.Description
+	}
+	if upstream.ImageURL != "" {
+		book.ImageURL = upstream.ImageURL
+	}
+	if upstream.ReleaseDate != nil {
+		book.ReleaseDate = upstream.ReleaseDate
+	}
+	if len(upstream.Genres) > 0 {
+		book.Genres = upstream.Genres
+	}
+	if upstream.AverageRating > 0 {
+		book.AverageRating = upstream.AverageRating
+		book.RatingsCount = upstream.RatingsCount
+	}
+	if upstream.Language != "" {
+		book.Language = upstream.Language
+	}
+	now := time.Now().UTC()
+	book.LastMetadataRefreshAt = &now
+
+	if err := h.books.Update(r.Context(), book); err != nil {
+		// A UNIQUE constraint means another book row already owns this foreign_id.
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "a different book already uses that foreign ID"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Re-link series membership: remove all existing links for this book, then
+	// attach whatever the upstream record declares.
+	if h.series != nil {
+		if existingIDs, serErr := h.series.GetSeriesIDsForBook(r.Context(), book.ID); serErr == nil {
+			for _, sid := range existingIDs {
+				_ = h.series.UnlinkBook(r.Context(), sid, book.ID)
+			}
+		}
+		for _, ref := range upstream.SeriesRefs {
+			s := &models.Series{ForeignID: ref.ForeignID, Title: ref.Title}
+			if err := h.series.CreateOrGet(r.Context(), s); err != nil {
+				slog.Warn("rebind: failed to upsert series", "series", ref.Title, "error", err)
+				continue
+			}
+			if err := h.series.LinkBook(r.Context(), s.ID, book.ID, ref.Position, ref.Primary); err != nil {
+				slog.Warn("rebind: failed to link book to series", "book", book.Title, "series", ref.Title, "error", err)
+			}
+		}
+	}
+
+	// Audit trail: record old and new identifiers so the operation is reversible
+	// by hand and visible in the activity history.
+	if h.history != nil {
+		type rebindData struct {
+			OldProvider  string `json:"oldProvider"`
+			OldForeignID string `json:"oldForeignId"`
+			NewProvider  string `json:"newProvider"`
+			NewForeignID string `json:"newForeignId"`
+		}
+		if data, jerr := json.Marshal(rebindData{oldProvider, oldForeignID, req.Provider, req.ForeignID}); jerr == nil {
+			bookID := book.ID
+			_ = h.history.Create(r.Context(), &models.HistoryEvent{
+				BookID:      &bookID,
+				EventType:   models.HistoryEventBookRebound,
+				SourceTitle: book.Title,
+				Data:        string(data),
+			})
+		}
+	}
+
+	h.attachBookFiles(r.Context(), book)
+	cleanBookDescription(book)
+	proxyBookImages(book)
+	writeJSON(w, http.StatusOK, book)
+}
+
 func (h *BookHandler) ToggleExcluded(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
