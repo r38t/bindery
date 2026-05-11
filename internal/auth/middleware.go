@@ -165,6 +165,10 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 				return
 			}
 			if key := requestAPIKey(r); key != "" && subtle.ConstantTimeCompare([]byte(key), []byte(p.APIKey())) == 1 {
+				// API key authentication is always treated as admin. Set the role
+				// so RequireAdmin-protected endpoints are accessible without a
+				// session cookie (Bug 11: misleading "admin role required" 403).
+				r = r.WithContext(context.WithValue(r.Context(), userRoleCtxKey, "admin"))
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -271,7 +275,11 @@ func RequireXRequestedWith(next http.Handler) http.Handler {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
 			// safe methods — pass through
 		default:
-			if requestAPIKey(r) == "" && r.Header.Get("X-Requested-With") != "bindery-ui" {
+			// Auth endpoints (login, setup, logout…) are exempt: there is no
+			// session cookie to protect against CSRF at those points, so
+			// requiring the header is pure friction for non-browser clients.
+			// This mirrors the identical exemption in RequireCSRFToken.
+			if requestAPIKey(r) == "" && !AllowUnauthPath(r.URL.Path) && r.Header.Get("X-Requested-With") != "bindery-ui" {
 				w.Header().Set("Content-Type", "application/json")
 				http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 				return

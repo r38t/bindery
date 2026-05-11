@@ -630,6 +630,80 @@ func TestCSRFStack_APIKeyGrabPassesAllGuards(t *testing.T) {
 	}
 }
 
+// TestRequireXRequestedWith_AllowsLoginEndpoint verifies that POST /api/v1/auth/login
+// passes through RequireXRequestedWith without the custom header. Before a session
+// exists there is no cookie to CSRF-protect, so blocking the login endpoint from plain
+// curl/scripts is pure friction with no security benefit.
+// Regression test for Bug 4: login unreachable from non-browser clients.
+func TestRequireXRequestedWith_AllowsLoginEndpoint(t *testing.T) {
+	called := false
+	h := RequireXRequestedWith(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	// No X-Requested-With, no API key — plain curl.
+	h.ServeHTTP(nopWriter{}, req)
+	if !called {
+		t.Fatal("POST /api/v1/auth/login must not be blocked by RequireXRequestedWith — no session to CSRF-protect")
+	}
+}
+
+// TestRequireXRequestedWith_AllowsSetupEndpoint mirrors the login case for the
+// first-run /auth/setup endpoint. Setup creates the very first user; there is
+// no authenticated session and therefore no CSRF risk.
+func TestRequireXRequestedWith_AllowsSetupEndpoint(t *testing.T) {
+	called := false
+	h := RequireXRequestedWith(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { called = true }))
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/auth/setup", nil)
+	h.ServeHTTP(nopWriter{}, req)
+	if !called {
+		t.Fatal("POST /api/v1/auth/setup must not be blocked by RequireXRequestedWith")
+	}
+}
+
+// TestAPIKeyAuthGrantsAdminRole verifies that a request authenticated via a
+// valid API key is granted admin role in the context, so RequireAdmin-protected
+// endpoints are reachable without a session cookie.
+// Regression test for Bug 11: API key auth bypasses CSRF but then fails at
+// the role check with a misleading "admin role required" 403.
+func TestAPIKeyAuthGrantsAdminRole(t *testing.T) {
+	secret := []byte("stack-secret")
+	p := &fakeProvider{mode: ModeEnabled, apiKey: "my-api-key", secret: secret}
+
+	called := false
+	stack := Middleware(p)(
+		RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		})),
+	)
+
+	req, _ := http.NewRequest("POST", "/api/v1/settings/auth/mode", nil)
+	req.Header.Set("X-Api-Key", "my-api-key")
+	rw := &captureWriter{}
+	stack.ServeHTTP(rw, req)
+	if !called {
+		t.Fatalf("API-key POST to admin-protected endpoint must reach the handler; got status %d", rw.status)
+	}
+}
+
+// TestAPIKeyAuthRoleVisibleInContext verifies that the admin role is present in
+// the request context when API key auth is used, so handlers can inspect it.
+func TestAPIKeyAuthRoleVisibleInContext(t *testing.T) {
+	secret := []byte("stack-secret")
+	p := &fakeProvider{mode: ModeEnabled, apiKey: "my-api-key", secret: secret}
+
+	var gotRole string
+	stack := Middleware(p)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gotRole = UserRoleFromContext(r.Context())
+	}))
+
+	req, _ := http.NewRequest("GET", "/api/v1/author", nil)
+	req.Header.Set("X-Api-Key", "my-api-key")
+	stack.ServeHTTP(nopWriter{}, req)
+	if gotRole != "admin" {
+		t.Errorf("role in context = %q; want \"admin\"", gotRole)
+	}
+}
+
 func TestCSRFStack_BrowserSessionWithoutCSRFTokenIsRejected(t *testing.T) {
 	secret := []byte("stack-secret")
 	p := &fakeProvider{mode: ModeEnabled, apiKey: "harpoon-key", secret: secret}
