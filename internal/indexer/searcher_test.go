@@ -575,6 +575,44 @@ func TestFilterCategoriesCustomIDs(t *testing.T) {
 	}
 }
 
+// TestFilterCategoriesMaM covers indexers like MyAnonamouse whose entire
+// taxonomy uses 100xxx IDs (e.g. 100013 = AudioBooks, 100111 = Audiobooks -
+// Young Adult). None of these match the standard 303x/702x prefix, so the
+// old code substituted the fallback 3030 — which MaM does not map to any of
+// its own subcategories, returning unrelated results.
+//
+// When all configured categories are non-standard (>9999) and no standard
+// match exists, filterCategoriesForMedia must pass them through as-is.
+func TestFilterCategoriesMaM(t *testing.T) {
+	// Typical MaM audiobook category list
+	mamAudioCats := []int{100013, 100039, 100041, 100042, 100044, 100045, 100046, 100047, 100111}
+
+	got := filterCategoriesForMedia(mamAudioCats, "audiobook")
+	if len(got) != len(mamAudioCats) {
+		t.Fatalf("MaM audiobook cats: got %v, want all %v passed through", got, mamAudioCats)
+	}
+	for i, c := range mamAudioCats {
+		if got[i] != c {
+			t.Errorf("MaM audiobook cats[%d]: got %d, want %d", i, got[i], c)
+		}
+	}
+
+	// MaM ebook category list
+	mamEbookCats := []int{100014, 100060, 100062, 100063, 100064, 100112}
+
+	got = filterCategoriesForMedia(mamEbookCats, "ebook")
+	if len(got) != len(mamEbookCats) {
+		t.Fatalf("MaM ebook cats: got %v, want all %v passed through", got, mamEbookCats)
+	}
+
+	// Standard indexer with no audiobook cats still falls back correctly —
+	// the non-standard path must not fire when all configured IDs are standard.
+	booksOnly := []int{7000, 7020}
+	if fb := filterCategoriesForMedia(booksOnly, "audiobook"); len(fb) != 1 || fb[0] != 3030 {
+		t.Errorf("standard ebook-only indexer should fall back to [3030] for audiobook, got %v", fb)
+	}
+}
+
 func TestFilterCategoriesParentDrop(t *testing.T) {
 	cases := []struct {
 		cats      []int

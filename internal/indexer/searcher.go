@@ -51,6 +51,12 @@ type MatchCriteria struct {
 // we substitute the standard Newznab category for that media type rather
 // than silently sending an ebook query — otherwise the search appears to
 // succeed but returns the wrong kind of release.
+//
+// Indexers with non-standard taxonomies (category IDs > 9999, e.g. MaM's
+// 100xxx subcategories) are passed through as-is when no standard-range
+// match exists. Substituting a standard fallback ID (3030, 7020) on such
+// indexers returns unrelated results because the standard IDs do not cover
+// the indexer's extended subcategory tree.
 func filterCategoriesForMedia(cats []int, mediaType string) []int {
 	wantTens := 702
 	fallback := []int{7020}
@@ -62,12 +68,19 @@ func filterCategoriesForMedia(cats []int, mediaType string) []int {
 		return fallback
 	}
 	var out []int
+	hasNonStandard := false
 	for _, c := range cats {
 		if c/10 == wantTens {
 			out = append(out, c)
 		}
+		if c > 9999 {
+			hasNonStandard = true
+		}
 	}
 	if len(out) == 0 {
+		if hasNonStandard {
+			return cats
+		}
 		return fallback
 	}
 	return out
