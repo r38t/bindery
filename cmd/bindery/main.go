@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -892,6 +895,16 @@ func main() {
 		slog.Info("serving under path prefix", "urlBase", cfg.URLBase)
 	}
 
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	gracePeriod := 30 * time.Second
+	if v := os.Getenv("BINDERY_SHUTDOWN_GRACE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			gracePeriod = d
+		}
+	}
+
 	addr := ":" + cfg.Port
 	slog.Info("listening", "addr", addr)
 	srv := &http.Server{
@@ -902,9 +915,26 @@ func main() {
 		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
-		slog.Error("server failed", "error", err)
-		os.Exit(1)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server failed", "error", err)
+			os.Exit(1)
+		}
+	case <-sigCtx.Done():
+		slog.Info("received shutdown signal, draining…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), gracePeriod)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("server shutdown did not complete cleanly", "error", err)
+		}
+		slog.Info("shutdown complete")
 	}
 }
 
