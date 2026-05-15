@@ -40,8 +40,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ping
-          image: ghcr.io/vavallee/bindery-ping:latest
-          imagePullPolicy: Always
+          image: ghcr.io/vavallee/bindery-ping:sha-619cc45f1d9b349914df49544996587741dbd1f8
+          imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
