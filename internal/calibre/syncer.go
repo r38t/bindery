@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,7 +48,8 @@ type SyncProgress struct {
 // pluginPusher captures the subset of *PluginClient the syncer needs, so
 // tests can inject a fake without standing up an HTTP server.
 type pluginPusher interface {
-	Add(ctx context.Context, filePath string) (int64, error)
+	Add(ctx context.Context, filePath string, meta Metadata) (int64, error)
+	Library(ctx context.Context) (string, error)
 }
 
 // BookLister is the subset of *db.BookRepo the syncer uses. Keeps the
@@ -56,11 +59,25 @@ type BookLister interface {
 	SetCalibreID(ctx context.Context, id, calibreID int64) error
 }
 
+// AuthorGetter is the subset of *db.AuthorRepo used to add author metadata
+// to plugin sync requests.
+type AuthorGetter interface {
+	GetByID(ctx context.Context, id int64) (*models.Author, error)
+}
+
+// EditionLister is the subset of *db.EditionRepo used to identify the
+// specific edition for the file being pushed.
+type EditionLister interface {
+	ListByBook(ctx context.Context, bookID int64) ([]models.Edition, error)
+}
+
 // Syncer orchestrates the "Push all to Calibre" bulk job. One sync runs
 // at a time — a second call returns ErrSyncAlreadyRunning. Progress is
 // mutex-protected and can be polled concurrently with the running job.
 type Syncer struct {
 	books     BookLister
+	authors   AuthorGetter
+	editions  EditionLister
 	newClient func(cfg Config) pluginPusher
 
 	mu       sync.Mutex
@@ -78,6 +95,15 @@ func NewSyncer(books BookLister) *Syncer {
 			return NewPluginClient(cfg.PluginURL, cfg.PluginAPIKey)
 		},
 	}
+}
+
+// WithMetadata attaches optional repositories used to enrich plugin sync
+// requests. Keeping this separate preserves the narrow constructor used in
+// tests while production can export authors and edition identifiers.
+func (s *Syncer) WithMetadata(authors AuthorGetter, editions EditionLister) *Syncer {
+	s.authors = authors
+	s.editions = editions
+	return s
 }
 
 // ErrSyncAlreadyRunning is returned when Start is called while a previous
@@ -171,6 +197,7 @@ func (s *Syncer) run(ctx context.Context, cfg Config) {
 	})
 
 	client := s.newClient(cfg)
+	sameLibrary := sameCalibreLibrary(ctx, cfg, client)
 
 	for i := range eligible {
 		if err := ctx.Err(); err != nil {
@@ -179,23 +206,33 @@ func (s *Syncer) run(ctx context.Context, cfg Config) {
 		}
 		b := &eligible[i]
 		path := pushPath(b)
-		id, addErr := client.Add(ctx, path)
+		meta, err := s.metadataForBook(ctx, b, path, sameLibrary)
+		if err != nil {
+			s.setProgress(func(p *SyncProgress) {
+				p.Stats.Failed++
+				p.Stats.Processed++
+				p.Errors = append(p.Errors, SyncError{
+					BookID: b.ID,
+					Title:  b.Title,
+					Path:   path,
+					Reason: err.Error(),
+				})
+			})
+			continue
+		}
+		id, addErr := client.Add(ctx, path, meta)
 		switch {
 		case addErr == nil:
-			if id > 0 {
-				if perr := s.books.SetCalibreID(ctx, b.ID, id); perr != nil {
-					slog.Warn("calibre sync: persist calibre_id failed", "bookId", b.ID, "calibreId", id, "error", perr)
-				}
+			if perr := s.persistCalibreID(ctx, b, id, sameLibrary); perr != nil {
+				slog.Warn("calibre sync: persist calibre_id failed", "bookId", b.ID, "calibreId", id, "error", perr)
 			}
 			s.setProgress(func(p *SyncProgress) {
 				p.Stats.Pushed++
 				p.Stats.Processed++
 			})
 		case errors.Is(addErr, ErrAlreadyInCalibre):
-			if id > 0 {
-				if perr := s.books.SetCalibreID(ctx, b.ID, id); perr != nil {
-					slog.Warn("calibre sync: persist calibre_id failed", "bookId", b.ID, "calibreId", id, "error", perr)
-				}
+			if perr := s.persistCalibreID(ctx, b, id, sameLibrary); perr != nil {
+				slog.Warn("calibre sync: persist calibre_id failed", "bookId", b.ID, "calibreId", id, "error", perr)
 			}
 			s.setProgress(func(p *SyncProgress) {
 				p.Stats.AlreadyInCalibre++
@@ -233,6 +270,133 @@ func pushPath(b *models.Book) string {
 		return b.EbookFilePath
 	}
 	return b.FilePath
+}
+
+func (s *Syncer) metadataForBook(ctx context.Context, b *models.Book, path string, sameLibrary bool) (Metadata, error) {
+	edition, err := s.editionForPath(ctx, b, path)
+	if err != nil {
+		return Metadata{}, err
+	}
+	authors, authorSort, err := s.authorMetadata(ctx, b)
+	if err != nil {
+		return Metadata{}, err
+	}
+	identifiers := IdentifiersForBook(b, edition)
+	if !sameLibrary && isCalibreOrigin(b) {
+		delete(identifiers, "calibre")
+	}
+	return Metadata{
+		Title:       b.Title,
+		Authors:     authors,
+		AuthorSort:  authorSort,
+		Language:    NormalizeLanguageForCalibre(b.Language),
+		Genres:      b.Genres,
+		Identifiers: identifiers,
+	}, nil
+}
+
+func (s *Syncer) authorMetadata(ctx context.Context, b *models.Book) ([]string, string, error) {
+	if b.Author != nil && strings.TrimSpace(b.Author.Name) != "" {
+		return []string{strings.TrimSpace(b.Author.Name)}, strings.TrimSpace(b.Author.SortName), nil
+	}
+	if s.authors == nil || b.AuthorID == 0 {
+		return nil, "", nil
+	}
+	author, err := s.authors.GetByID(ctx, b.AuthorID)
+	if err != nil {
+		return nil, "", err
+	}
+	if author == nil || strings.TrimSpace(author.Name) == "" {
+		return nil, "", nil
+	}
+	return []string{strings.TrimSpace(author.Name)}, strings.TrimSpace(author.SortName), nil
+}
+
+func (s *Syncer) editionForPath(ctx context.Context, b *models.Book, path string) (*models.Edition, error) {
+	if s.editions == nil {
+		return nil, nil
+	}
+	editions, err := s.editions.ListByBook(ctx, b.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(editions) == 0 {
+		return nil, nil
+	}
+
+	ext := strings.TrimPrefix(filepath.Ext(path), ".")
+	if ext != "" {
+		format := strings.ToUpper(strings.TrimSpace(ext))
+		var firstFormatMatch *models.Edition
+		for i := range editions {
+			if strings.ToUpper(strings.TrimSpace(editions[i].Format)) != format {
+				continue
+			}
+			if b.SelectedEditionID != nil && editions[i].ID == *b.SelectedEditionID {
+				return &editions[i], nil
+			}
+			if firstFormatMatch == nil {
+				firstFormatMatch = &editions[i]
+			}
+		}
+		if firstFormatMatch != nil {
+			return firstFormatMatch, nil
+		}
+	}
+
+	if b.SelectedEditionID != nil {
+		for i := range editions {
+			if editions[i].ID == *b.SelectedEditionID {
+				return &editions[i], nil
+			}
+		}
+	}
+	return &editions[0], nil
+}
+
+func (s *Syncer) persistCalibreID(ctx context.Context, b *models.Book, id int64, sameLibrary bool) error {
+	if id <= 0 {
+		return nil
+	}
+	if isCalibreOrigin(b) && !sameLibrary {
+		slog.Debug("calibre sync: not overwriting source calibre_id with target library id",
+			"bookId", b.ID, "targetCalibreId", id)
+		return nil
+	}
+	return s.books.SetCalibreID(ctx, b.ID, id)
+}
+
+func sameCalibreLibrary(ctx context.Context, cfg Config, client pluginPusher) bool {
+	source := cleanLibraryPath(cfg.LibraryPath)
+	if source == "" {
+		return false
+	}
+	target, err := client.Library(ctx)
+	if err != nil {
+		slog.Warn("calibre sync: target library identity unavailable; treating plugin target as separate from import source", "error", err)
+		return false
+	}
+	target = cleanLibraryPath(target)
+	if target == "" {
+		return false
+	}
+	return source == target
+}
+
+func cleanLibraryPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
+}
+
+func isCalibreOrigin(b *models.Book) bool {
+	if b == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(b.MetadataProvider), "calibre") ||
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(b.ForeignID)), "calibre:book:")
 }
 
 func (s *Syncer) fail(msg string) {
