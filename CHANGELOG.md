@@ -6,6 +6,9 @@ All notable changes to Bindery are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A page crash no longer blanks the whole app** — page render errors are now caught by a route-scoped error boundary that shows the error inline while keeping the nav/header usable, and clears itself when you navigate to another page (no reload needed). Previously the only boundary was the root one, whose full-screen dark-mode fallback took over the entire viewport and required a manual reload to recover.
 ### Fixed
 
 - **Audiobook downloads could hang in "downloading" forever (qBittorrent)** — the main import poll (`checkQbittorrentDownloads`) queried only the client's ebook `Category`, so torrents grabbed under `CategoryAudiobook` were never returned and their downloads never matched (logged as `download not found in torrent list`), leaving them stuck. The #700 fix that polls both categories had only been applied to the stall/health adapters, not this poll. It now polls every category the client may have grabbed under via `CategoriesToPoll`. Transmission and Deluge are unaffected (Transmission does not split audiobooks by category/dir; Deluge polls all torrents).
