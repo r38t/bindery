@@ -549,7 +549,7 @@ func (s *Scanner) blockStaleImportFailures(
 ) {
 	allDownloads, err := s.downloads.List(ctx)
 	if err != nil {
-		slog.Debug("blockStaleImportFailures: failed to list downloads", "error", err)
+		slog.Warn("blockStaleImportFailures: failed to list downloads", "error", err)
 		return
 	}
 	for i := range allDownloads {
